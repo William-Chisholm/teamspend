@@ -1,0 +1,48 @@
+name: teamspend
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-teamspend}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-teamspend}
+      POSTGRES_DB: ${POSTGRES_DB:-teamspend}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-teamspend}:${POSTGRES_PASSWORD:-teamspend}@db:5432/${POSTGRES_DB:-teamspend}
+      SECRET_KEY: ${SECRET_KEY:-dev-only-change-me}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+      WATCHPACK_POLLING: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
