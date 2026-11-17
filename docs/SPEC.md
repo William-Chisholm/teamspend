@@ -18,7 +18,7 @@ TeamSpend is a multi-tenant expense approval app. Users can belong to multiple o
 
 | Layer | Choice |
 |---|---|
-| Backend | Python 3.12, Flask, SQLAlchemy 2.x, Alembic (Flask-Migrate) |
+| Backend | Python 3.12, Flask, Flask-SQLAlchemy, SQLAlchemy 2.x, Alembic (Flask-Migrate) |
 | Database | PostgreSQL 16+ |
 | Validation | Pydantic |
 | Auth | PyJWT, argon2-cffi |
@@ -34,6 +34,7 @@ teamspend/
   CLAUDE.md
   README.md
   docker-compose.yml
+  .env.example
   docs/SPEC.md
   backend/
     app/
@@ -52,7 +53,10 @@ teamspend/
       unit/
       integration/
       isolation/
-    pyproject.toml
+    Dockerfile
+    requirements.txt
+    requirements-dev.txt
+    pyproject.toml         # ruff and pytest config
   frontend/
 ```
 
@@ -88,14 +92,23 @@ users(id, email UNIQUE, password_hash, name, created_at)
 organizations(id, name, slug UNIQUE, created_at)
 memberships(id, user_id, org_id, role, created_at, UNIQUE(user_id, org_id))
 invites(id, org_id, email, role, token_hash, expires_at, accepted_at, created_by, created_at)
-categories(id, org_id, name, UNIQUE(org_id, name))
+categories(id, org_id, name, UNIQUE(org_id, name), UNIQUE(org_id, id))
 expenses(id, org_id, submitted_by, category_id, amount_cents CHECK > 0, currency DEFAULT 'USD',
-         description, expense_date, status, receipt_key, created_at, updated_at)
-expense_events(id, org_id, expense_id, actor_id, from_status, to_status, comment, created_at)
+         description, expense_date, status, receipt_key, created_at, updated_at,
+         UNIQUE(org_id, id), FK(org_id, category_id) -> categories(org_id, id))
+expense_events(id, org_id, expense_id, actor_id, from_status, to_status, comment, created_at,
+               FK(org_id, expense_id) -> expenses(org_id, id))
 audit_log(id, org_id, actor_id, action, entity_type, entity_id, diff_json JSONB, created_at)
 ```
 
 Indexes: `(org_id, status, created_at)` on `expenses`, `(org_id, created_at)` on `audit_log`, `(org_id, expense_id)` on `expense_events`.
+
+**Design notes**
+
+- **Enums** (`role`, `status`) are stored as `VARCHAR` with named `CHECK` constraints, not native Postgres enums, because native enums are painful to alter in migrations. The database still rejects invalid values.
+- **Composite foreign keys** make the database itself refuse cross-org references: an expense can only point at a category in the same org, and an event only at an expense in the same org. This backs up the app-level scoping in section 6.
+- **`amount_cents`, `category_id`, and `expense_date` are `NOT NULL` from creation.** A draft is always a complete expense.
+- **Constraint names** follow a naming convention (`pk_`, `fk_`, `uq_`, `ck_`, `ix_` prefixes) so Alembic migrations are deterministic.
 
 **Global tables** (not tenant-scoped): `users`, `organizations`. `memberships` is queried by `user_id` during login and org listing, which is only allowed through the explicit `unscoped()` helper inside `auth/` and `tenancy/`.
 
@@ -114,7 +127,7 @@ draft ──submit──▶ submitted ──approve──▶ approved ──reim
 
 | From | To | Who | Rules |
 |---|---|---|---|
-| draft | submitted | submitter | Requires amount, category, date |
+| draft | submitted | submitter | Amount, category, and date are already required when the draft is created |
 | submitted | draft | submitter | Withdraw |
 | submitted | approved | approver+ | Not the submitter |
 | submitted | rejected | approver+ | Not the submitter; comment required |
@@ -132,7 +145,7 @@ draft ──submit──▶ submitted ──approve──▶ approved ──reim
 2. **Automatic scoping:** a SQLAlchemy `do_orm_execute` hook applies `with_loader_criteria` for every model using `TenantMixin`, so all ORM reads are filtered by the current `org_id`. A `before_flush` hook rejects any insert or update whose `org_id` doesn't match the context.
 3. **Never trust the client:** `org_id` in request bodies is ignored or rejected. It always comes from the URL plus the membership check.
 4. **No existence leaks:** cross-tenant resource IDs return `404`, and so does an org the caller isn't a member of.
-5. **No raw SQL in routes.** `text()` and raw queries are allowed only in migrations and `tenancy/`.
+5. **No raw SQL in routes.** `text()` and raw queries are allowed only in migrations, `tenancy/`, and test setup.
 6. **Stretch, defense in depth:** PostgreSQL Row-Level Security with `SET LOCAL app.current_org` per request and policies on tenant tables. Note that RLS is bypassed by superusers and table owners unless `FORCE ROW LEVEL SECURITY` is set, so the app must connect as a non-owner role.
 
 ## 7. Authentication
@@ -178,7 +191,7 @@ GET    /api/orgs/{org_id}/dashboard              # spend by category/month, pend
 ## 10. Testing strategy
 
 - **Unit:** state machine transitions and the permission matrix, with a parametrized test per matrix cell.
-- **Integration:** API tests against a real Postgres test database.
+- **Integration:** API tests against a real Postgres test database (`<db>_test`, created automatically and built from the models).
 - **Isolation suite** (the headline feature). With two orgs seeded, assert that for every tenant endpoint:
   - a user in Org A requesting an Org B resource ID gets `404`
   - a user who isn't a member of Org B calling `/orgs/B/...` gets `404`
@@ -186,7 +199,7 @@ GET    /api/orgs/{org_id}/dashboard              # spend by category/month, pend
   - a body-supplied `org_id` is ignored or rejected
   - a role held in Org A grants nothing in Org B
 - **Route coverage meta-test:** enumerate the Flask URL map and fail if any `/api/orgs/<org_id>/...` route lacks an RBAC decorator or an isolation test. New endpoints can't ship unprotected.
-- **CI:** GitHub Actions runs lint and the full test suite on every PR.
+- **CI:** GitHub Actions runs lint and the full test suite on every PR, and checks that Alembic migrations match the models (tests build tables from the models, not from migrations).
 
 ## 11. Non-goals (MVP)
 
