@@ -12,5 +12,8 @@ def create_app(config_object: type[Config] = Config) -> Flask:
     db.init_app(app)
     migrate.init_app(app, db)
 
+    # Import models so Alembic autogenerate and db.create_all() can see them.
+    from . import models  # noqa: F401
+
     app.register_blueprint(health_bp, url_prefix="/api")
     return app
